@@ -169,9 +169,26 @@ remove_dead_links ()
 #   Runs shell commands (@shell)
 create_links ()
 {
-  grep -v '^#' $1 | tr -d '\r' | grep -v '^\s*$' | \
-  while read svn real; do
-    module_dir=`dirname $1`
+
+  file=$1
+  grep -nv '^#' $file | tr -d '\r' | grep -v '^[0-9]+:\s*$' | \
+  while read line; do
+
+	OLDIFS="$IFS"
+  	IFS="$IFS:"
+  	set - $line
+	IFS="$OLDIFS"
+	line="$1"
+	svn="$2"
+	real="$3"
+
+	# sanity check for empty data to prevent working copy tree to be emptied
+	if [ -z "$svn" -o -z "$real" ]; then
+		echo "invalid data read from $file($line): svn='$svn' real='$real'"
+		return 1
+	fi
+
+    module_dir=`dirname $file`
     src=$module_dir/$svn
     dest=$root/${real%/}
 
