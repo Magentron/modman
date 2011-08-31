@@ -21,27 +21,27 @@
 #    - The following common utilities must be locatable in your $PATH
 #       grep (POSIX), find, ln, cp, basename, dirname, readlink
 
-version="1.1.7"
+version="1.2.2"
 script=${0##*/}
 usage="\
 Module Manager (v$version)
 
 Global Commands: $script <command>
 ------------------------------
-  init           initialize the current directory as the modman root
-  list           list all valid modules that are currently checked out
-  update-all     update all modules that are currently checked out
-  deploy-all     deploy all modules (no VCS interaction)
-  repair         rebuild all modman-created symlinks (no updates performed)
-  --version      display the modman script's version
+  init [basedir]     initialize the pwd (or [basedir]) as the modman deploy root
+  list               list all valid modules that are currently checked out
+  update-all         update all modules that are currently checked out
+  deploy-all         deploy all modules (no VCS interaction)
+  repair             rebuild all modman-created symlinks (no updates performed)
+  --version          display the modman script's version
 
 Module Actions: $script <module> <action> [<options>]
 ------------------------------
-  checkout       checkout a new modman compatible module using subversion
-  clone          checkout a new modman compatible module using git
-  update         update module using the appropriate SCM
-  deploy         deploy an existing module (SCM not required)
-  deploy --copy  deploy with hardlinks instead of symlinks (not recommended)
+  checkout           checkout a new modman compatible module using subversion
+  clone              checkout a new modman compatible module using git
+  update             update module using the appropriate SCM
+  deploy             deploy an existing module (SCM not required)
+  deploy --copy      deploy with hardlinks instead of symlinks (not recommended)
 
 Writing modman modules:
 ------------------------------
@@ -114,7 +114,14 @@ colin@mollenhour.com
 ###########################
 # Handle "init" command, simply create .modman directory
 if [ "$1" = "init" ]; then
-  mkdir .modman && echo "Initialized Module Manager at `pwd`"
+  basedir=$2
+  [[ -n "$basedir" && -d "$basedir" ]] || { echo "$basedir is not a directory."; exit 1; }
+  mkdir .modman || { echo "Could not create .modman directory" && exit 1; }
+  if [ -n "$basedir" ]; then
+    echo "$basedir" > .modman/.basedir
+    basedir="with basedir at $basedir"
+  fi
+  echo "Initialized Module Manager at $(pwd) $basedir"
   exit 0
 ###########################
 # Handle "--help" command
@@ -135,11 +142,20 @@ root=$_pwd
 while ! [ -d $root/.modman ]; do
   if [ "$root" = "/" ]; then echo -e $mm_not_found && exit 1; fi
   cd .. || { echo -e "ERROR: Could not traverse up from $root\n$mm_not_found" && exit 1; }
-  root=`pwd`
+  root=$(pwd)
 done
 
 mm=$root/.modman      # path to .modman
 FORCE=0               # --force option off by default
+
+# Allow a different root to be specified as the base dir for deploying modules
+if [ -r $mm/.basedir ]; then
+  newroot=$(cat $mm/.basedir)
+  if [ -d $newroot ]; then
+    cd $newroot || { echo -e "Could not change dir to basedir specified in .basedir file: $newroot" && exit 1; }
+    root=$(pwd)
+  fi
+fi
 
 #############################################################
 # Check for existence of a module directory and modman file
@@ -169,26 +185,28 @@ remove_dead_links ()
 #   Runs shell commands (@shell)
 create_links ()
 {
-
   file=$1
-  grep -nv '^#' $file | tr -d '\r' | grep -v '^[0-9]+:\s*$' | \
-  while read line; do
 
-	OLDIFS="$IFS"
-  	IFS="$IFS:"
-  	set - $line
-	IFS="$OLDIFS"
-	line="$1"
-	svn="$2"
-	real="$3"
+  # Use a new file descriptor when called recursively
+  FD=$((FD+1))
+  eval "exec $FD< <(grep -nv '^#' $file | tr -d '\r' | grep -Ev '^[0-9]+:\s*$')"
+  while read -u$FD line; do
 
-	# sanity check for empty data to prevent working copy tree to be emptied
-	if [ -z "$svn" -o -z "$real" ]; then
-		echo "invalid data read from $file($line): svn='$svn' real='$real'"
-		return 1
-	fi
+    # Split <linenum>:<svn> <real>
+    OLDIFS="$IFS"
+    IFS="$IFS:"
+    set - $line
+    IFS="$OLDIFS"
+    svn="$2"
+    real="$3"
 
-    module_dir=`dirname $file`
+    # Sanity check for empty data
+    if [ -z "$svn" -o -z "$real" ]; then
+      echo "ERROR: Malformed modman file in $file on line $line"
+      return 1
+    fi
+
+    module_dir=$(dirname $file)
     src=$module_dir/$svn
     dest=$root/${real%/}
 
@@ -208,7 +226,10 @@ create_links ()
       cd $module_dir
       export PROJECT=$root
       export MODULE=$module_dir
-      echo $real | bash
+      shell_tmp=$(mktemp $mm/.tmp.XXXXXXX)
+      echo $real > $shell_tmp
+      bash $shell_tmp
+      rm -f $shell_tmp
       continue
     fi
 
@@ -275,8 +296,14 @@ create_links ()
       fi
     fi
   done
+
+  # Close file descriptor and decrement counter
+  eval "exec $FD<&-"
+  FD=$((FD-1))
+
   return 0
 }
+FD=3  # Emulate a stack for file descriptors starting at 3
 
 ###########################################################################
 # Similar to create_links but creates hardlinks instead of using symlinks
@@ -332,7 +359,7 @@ elif [ "$1" = "deploy-all" ]; then
   if [ -n "$2" ]; then echo "Too many arguments to deploy-all command."; exit 1; fi
   for module in `ls $mm`; do
     test -d $mm/$module || continue;
-    require_wc $module && echo "Deploying $module"
+    require_wc $module && echo "Deploying $module to $root"
     create_links $mm/$module/modman && echo -e "Deployment of $module complete.\n"
   done
   remove_dead_links $root
@@ -363,9 +390,10 @@ elif [ "$1" = "update-all" ]; then
 # Handle "repair" command
 elif [ "$1" = "repair" ]; then
   if [ "$2" == "--force" ]; then FORCE=1; shift; fi
-  mv $mm $root/.modman-repairing || { echo "Could not temporarily rename .modman directory"; exit 1; }
+  echo "Repairing links, do not interrupt."
+  mv $mm $mm-repairing || { echo "Could not temporarily rename .modman directory."; exit 1; }
   remove_dead_links $root
-  mv $root/.modman-repairing $mm || { echo "Could not restore .modman directory"; exit 1; }
+  mv $mm-repairing $mm || { echo "Could not restore .modman directory."; exit 1; }
   for module in `ls $mm`; do
     test -d $mm/$module || continue;
     require_wc $module && create_links $mm/$module/modman && echo -e "Repaired $module.\n"
@@ -379,7 +407,7 @@ fi
 # Discover if modman is run from within a module directory
 cd $_pwd
 module=''
-while [ "$root" != "$(pwd)" ]; do
+while [ "$(dirname $mm)" != "$(pwd)" && "$(pwd)" != "/" ]; do
   modpath=`pwd`
   if [ "$mm" = "$(dirname $modpath)" ]; then
     module=$(basename $modpath)
